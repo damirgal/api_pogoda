@@ -2,7 +2,7 @@ import sqlite3
 from fastapi import FastAPI, HTTPException, Header, Depends, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 # --- НАСТРОЙКИ ---
@@ -11,36 +11,55 @@ DB_NAME = "iot_data.db"
 
 app = FastAPI(title="Sensor Data API")
 
+
 # --- МОДЕЛЬ ДАННЫХ ---
 class SensorData(BaseModel):
     temperature: float = Field(..., description="Температура")
     humidity: float = Field(..., description="Влажность")
     pressure: float = Field(..., description="Давление")
-    recorded_at: str = Field(..., description="Дата и время в формате ISO 8601")
+    recorded_at: str = Field(..., description="Дата и время с устройства (ISO 8601)")
 
-# --- ИНИЦИАЛИЗАЦИЯ БД ---
+
+# --- ИНИЦИАЛИЗАЦИЯ БД С МИГРАЦИЕЙ ---
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
+
+        # Создаём таблицу (если её нет) с новым столбцом created_at
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sensor_readings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 temperature REAL NOT NULL,
                 humidity REAL NOT NULL,
                 pressure REAL NOT NULL,
-                recorded_at TEXT NOT NULL
+                recorded_at TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now', '+5 hours'))
             )
         ''')
         conn.commit()
 
+        # Миграция: добавляем created_at в существующую таблицу (если его нет)
+        cursor.execute("PRAGMA table_info(sensor_readings)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'created_at' not in columns:
+            cursor.execute('''
+                ALTER TABLE sensor_readings 
+                ADD COLUMN created_at TEXT DEFAULT (datetime('now', '+5 hours'))
+            ''')
+            conn.commit()
+            print("✅ Добавлен столбец created_at (UTC+5)")
+
+
 init_db()
+
 
 # --- ПРОВЕРКА ТОКЕНА ---
 def verify_token(x_api_token: str = Header(..., alias="X-API-Token")):
     if x_api_token != SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Неверный или отсутствующий токен доступа")
 
-# --- API ENDPOINTS (защищены токеном) ---
+
+# --- API: Добавление данных ---
 @app.post("/api/v1/sensors", status_code=201)
 def add_sensor_data(data: SensorData, _token: str = Depends(verify_token)):
     try:
@@ -50,6 +69,7 @@ def add_sensor_data(data: SensorData, _token: str = Depends(verify_token)):
 
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
+        # created_at заполнится автоматически через DEFAULT
         cursor.execute('''
             INSERT INTO sensor_readings (temperature, humidity, pressure, recorded_at)
             VALUES (?, ?, ?, ?)
@@ -59,6 +79,8 @@ def add_sensor_data(data: SensorData, _token: str = Depends(verify_token)):
 
     return {"status": "success", "message": "Данные успешно сохранены", "id": new_id}
 
+
+# --- API: Последние показания ---
 @app.get("/api/v1/sensors/latest")
 def get_latest_data(_token: str = Depends(verify_token)):
     with sqlite3.connect(DB_NAME) as conn:
@@ -70,38 +92,33 @@ def get_latest_data(_token: str = Depends(verify_token)):
         return dict(row)
     raise HTTPException(status_code=404, detail="Данные еще не поступали")
 
+
 # --- API: Получение данных с фильтрацией (открытый доступ) ---
 @app.get("/api/v1/sensors/all")
 def get_all_data(
-    limit: Optional[int] = Query(100, ge=1, le=10000),
-    from_date: Optional[str] = Query(None, description="Начальная дата (ISO 8601)"),
-    to_date: Optional[str] = Query(None, description="Конечная дата (ISO 8601)")
+        from_date: Optional[str] = Query(None, description="Начальная дата (YYYY-MM-DD)"),
+        to_date: Optional[str] = Query(None, description="Конечная дата (YYYY-MM-DD)")
 ):
     """
-    Возвращает записи с возможностью фильтрации по диапазону дат.
-    Если указаны from_date/to_date — лимит не применяется.
-    Данные отсортированы по дате убывания (новые сверху).
+    Возвращает записи. Если фильтры не указаны — последние 7 дней.
+    Данные отсортированы по recorded_at убывания (новые сверху).
     """
-    query = "SELECT * FROM sensor_readings"
+    # По умолчанию — последние 7 дней
+    if not from_date and not to_date:
+        to_date = datetime.now().strftime('%Y-%m-%d')
+        from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+
+    query = "SELECT * FROM sensor_readings WHERE 1=1"
     params = []
-    conditions = []
 
     if from_date:
-        conditions.append("recorded_at >= ?")
-        params.append(from_date)
+        query += " AND recorded_at >= ?"
+        params.append(from_date + " 00:00:00")
     if to_date:
-        conditions.append("recorded_at <= ?")
-        params.append(to_date)
-
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
+        query += " AND recorded_at <= ?"
+        params.append(to_date + " 23:59:59")
 
     query += " ORDER BY recorded_at DESC"
-
-    # Лимит применяем только если нет фильтра по датам
-    if not (from_date or to_date):
-        query += " LIMIT ?"
-        params.append(limit)
 
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
@@ -110,6 +127,16 @@ def get_all_data(
         rows = cursor.fetchall()
 
     return [dict(row) for row in rows]
+
+
+# --- API: Общее количество записей ---
+@app.get("/api/v1/sensors/count")
+def get_total_count():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) as cnt FROM sensor_readings')
+        return {"count": cursor.fetchone()[0]}
+
 
 # --- ВЕБ-ИНТЕРФЕЙС ---
 @app.get("/", response_class=HTMLResponse)
@@ -154,7 +181,6 @@ def web_dashboard():
                 backdrop-filter: blur(10px);
             }
 
-            /* Карточки последних показаний */
             .cards {
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
@@ -177,7 +203,6 @@ def web_dashboard():
             .hum-card .card-value { color: #3498db; }
             .press-card .card-value { color: #9b59b6; }
 
-            /* Панель фильтров */
             .filters {
                 background: white;
                 padding: 20px;
@@ -193,7 +218,7 @@ def web_dashboard():
                 display: flex;
                 flex-direction: column;
                 flex: 1;
-                min-width: 180px;
+                min-width: 160px;
             }
             .filter-group label {
                 font-size: 0.85em;
@@ -223,23 +248,13 @@ def web_dashboard():
                 transition: all 0.2s;
                 white-space: nowrap;
             }
-            .btn-primary {
-                background: #667eea;
-                color: white;
-            }
+            .btn-primary { background: #667eea; color: white; }
             .btn-primary:hover { background: #5568d3; transform: translateY(-2px); }
-            .btn-secondary {
-                background: #e0e0e0;
-                color: #333;
-            }
+            .btn-secondary { background: #e0e0e0; color: #333; }
             .btn-secondary:hover { background: #d0d0d0; }
-            .btn-success {
-                background: #27ae60;
-                color: white;
-            }
+            .btn-success { background: #27ae60; color: white; }
             .btn-success:hover { background: #219a52; transform: translateY(-2px); }
 
-            /* Графики */
             .charts {
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
@@ -262,7 +277,6 @@ def web_dashboard():
                 height: 250px;
             }
 
-            /* Таблица */
             .table-container {
                 background: white;
                 border-radius: 15px;
@@ -304,8 +318,8 @@ def web_dashboard():
             .temp { color: #e74c3c; font-weight: 600; }
             .hum { color: #3498db; font-weight: 600; }
             .press { color: #9b59b6; font-weight: 600; }
+            .time-col { color: #888; font-size: 0.9em; }
 
-            /* Спиннер и сообщения */
             .loader {
                 text-align: center;
                 padding: 40px;
@@ -343,7 +357,7 @@ def web_dashboard():
             @media (max-width: 600px) {
                 header h1 { font-size: 1.8em; }
                 .card-value { font-size: 2em; }
-                th, td { padding: 8px; font-size: 0.9em; }
+                th, td { padding: 8px; font-size: 0.85em; }
                 .filters { flex-direction: column; }
             }
         </style>
@@ -356,29 +370,26 @@ def web_dashboard():
                 <div class="stats">📊 Всего записей: <strong id="totalCount">—</strong></div>
             </header>
 
-            <!-- Карточки последних показаний -->
             <div class="cards" id="latestCards">
                 <div class="loader"><div class="spinner"></div>Загрузка...</div>
             </div>
 
-            <!-- Фильтры -->
             <div class="filters">
                 <div class="filter-group">
                     <label for="fromDate">📅 С даты</label>
-                    <input type="datetime-local" id="fromDate">
+                    <input type="date" id="fromDate">
                 </div>
                 <div class="filter-group">
                     <label for="toDate">📅 По дату</label>
-                    <input type="datetime-local" id="toDate">
+                    <input type="date" id="toDate">
                 </div>
                 <div class="btn-group">
                     <button class="btn-primary" onclick="applyFilters()">🔍 Применить</button>
-                    <button class="btn-secondary" onclick="resetFilters()">↺ Сбросить</button>
+                    <button class="btn-secondary" onclick="resetFilters()">↺ Сбросить (7 дней)</button>
                     <button class="btn-success" onclick="exportCSV()">📥 Экспорт CSV</button>
                 </div>
             </div>
 
-            <!-- Графики -->
             <div class="charts">
                 <div class="chart-box">
                     <h3>🌡️ Температура, °C</h3>
@@ -389,12 +400,11 @@ def web_dashboard():
                     <div class="chart-wrapper"><canvas id="humChart"></canvas></div>
                 </div>
                 <div class="chart-box">
-                    <h3>🎯 Давление, hPa</h3>
+                    <h3>🎯 Давление, мм рт.ст.</h3>
                     <div class="chart-wrapper"><canvas id="pressChart"></canvas></div>
                 </div>
             </div>
 
-            <!-- Таблица -->
             <div class="table-container">
                 <div class="table-header">
                     <h2>📋 История показаний</h2>
@@ -407,11 +417,12 @@ def web_dashboard():
                             <th>Температура</th>
                             <th>Влажность</th>
                             <th>Давление</th>
-                            <th>Дата и время</th>
+                            <th>Время устройства</th>
+                            <th>Время сервера</th>
                         </tr>
                     </thead>
                     <tbody id="dataTable">
-                        <tr><td colspan="5" class="loader"><div class="spinner"></div>Загрузка...</td></tr>
+                        <tr><td colspan="6" class="loader"><div class="spinner"></div>Загрузка...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -425,7 +436,25 @@ def web_dashboard():
             let currentData = [];
             let charts = {};
 
-            // Инициализация графиков
+            // Форматирование даты для input type="date"
+            function formatDateForInput(date) {
+                const d = new Date(date);
+                const year = d.getFullYear();
+                const month = String(d.getMonth() + 1).padStart(2, '0');
+                const day = String(d.getDate()).padStart(2, '0');
+                return `${year}-${month}-${day}`;
+            }
+
+            // Установка фильтров по умолчанию (последние 7 дней)
+            function setDefaultDates() {
+                const today = new Date();
+                const sevenDaysAgo = new Date();
+                sevenDaysAgo.setDate(today.getDate() - 7);
+
+                document.getElementById('toDate').value = formatDateForInput(today);
+                document.getElementById('fromDate').value = formatDateForInput(sevenDaysAgo);
+            }
+
             function initCharts() {
                 const commonOptions = {
                     responsive: true,
@@ -467,24 +496,22 @@ def web_dashboard():
                 charts.press = new Chart(document.getElementById('pressChart'), {
                     type: 'line',
                     data: { datasets: [{ data: [], borderColor: '#9b59b6', backgroundColor: 'rgba(155,89,182,0.1)', fill: true }] },
-                    options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'hPa' } } } }
+                    options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'мм рт.ст.' } } } }
                 });
             }
 
-            // Загрузка последних показаний для карточек
             async function loadLatest() {
                 try {
-                    const resp = await fetch('/api/v1/sensors/all?limit=1');
-                    const data = await resp.json();
-                    const container = document.getElementById('latestCards');
-
-                    if (data.length === 0) {
-                        container.innerHTML = '<div class="empty">📭 Нет данных. Отправьте показания через API.</div>';
+                    const resp = await fetch('/api/v1/sensors/latest', {
+                        headers: { 'X-API-Token': 'my_super_secret_token_2026' }
+                    });
+                    if (!resp.ok) {
+                        document.getElementById('latestCards').innerHTML = 
+                            '<div class="empty">📭 Нет данных. Отправьте показания через API.</div>';
                         return;
                     }
-
-                    const d = data[0];
-                    container.innerHTML = `
+                    const d = await resp.json();
+                    document.getElementById('latestCards').innerHTML = `
                         <div class="card temp-card">
                             <div class="card-title">🌡️ Температура</div>
                             <div class="card-value">${d.temperature.toFixed(1)} °C</div>
@@ -497,7 +524,7 @@ def web_dashboard():
                         </div>
                         <div class="card press-card">
                             <div class="card-title">🎯 Давление</div>
-                            <div class="card-value">${d.pressure.toFixed(1)} hPa</div>
+                            <div class="card-value">${d.pressure.toFixed(1)} мм рт.ст.</div>
                             <div class="card-time">${formatDate(d.recorded_at)}</div>
                         </div>
                     `;
@@ -506,15 +533,13 @@ def web_dashboard():
                 }
             }
 
-            // Загрузка данных с фильтрами
             async function loadData() {
                 const from = document.getElementById('fromDate').value;
                 const to = document.getElementById('toDate').value;
 
                 let url = '/api/v1/sensors/all?';
-                if (from) url += `from_date=${encodeURIComponent(from.replace('T', ' '))}:00&`;
-                if (to) url += `to_date=${encodeURIComponent(to.replace('T', ' '))}:59&`;
-                if (!from && !to) url += 'limit=500&';
+                if (from) url += `from_date=${from}&`;
+                if (to) url += `to_date=${to}&`;
 
                 try {
                     const resp = await fetch(url);
@@ -525,15 +550,14 @@ def web_dashboard():
                 } catch (e) {
                     console.error('Ошибка загрузки данных:', e);
                     document.getElementById('dataTable').innerHTML =
-                        '<tr><td colspan="5" style="text-align:center;color:#e74c3c;">Ошибка загрузки данных</td></tr>';
+                        '<tr><td colspan="6" style="text-align:center;color:#e74c3c;">Ошибка загрузки данных</td></tr>';
                 }
             }
 
-            // Рендер таблицы (данные уже отсортированы по убыванию с сервера)
             function renderTable(data) {
                 const tbody = document.getElementById('dataTable');
                 if (data.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;">Нет данных по выбранным фильтрам</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;">Нет данных по выбранному периоду</td></tr>';
                     return;
                 }
                 tbody.innerHTML = data.map(d => `
@@ -541,30 +565,25 @@ def web_dashboard():
                         <td>${d.id}</td>
                         <td class="temp">${d.temperature.toFixed(1)} °C</td>
                         <td class="hum">${d.humidity.toFixed(1)} %</td>
-                        <td class="press">${d.pressure.toFixed(1)} hPa</td>
-                        <td>${formatDate(d.recorded_at)}</td>
+                        <td class="press">${d.pressure.toFixed(1)}</td>
+                        <td class="time-col">${formatDate(d.recorded_at)}</td>
+                        <td class="time-col">${d.created_at ? formatDate(d.created_at) : '—'}</td>
                     </tr>
                 `).join('');
             }
 
-            // Рендер графиков (данные сортируем по возрастанию для оси X)
             function renderCharts(data) {
                 const sorted = [...data].sort((a, b) => new Date(a.recorded_at) - new Date(b.recorded_at));
-                const points = sorted.map(d => ({ x: d.recorded_at.replace(' ', 'T'), y: d.temperature }));
-                const humPoints = sorted.map(d => ({ x: d.recorded_at.replace(' ', 'T'), y: d.humidity }));
-                const pressPoints = sorted.map(d => ({ x: d.recorded_at.replace(' ', 'T'), y: d.pressure }));
-
-                charts.temp.data.datasets[0].data = points;
-                charts.hum.data.datasets[0].data = humPoints;
-                charts.press.data.datasets[0].data = pressPoints;
-
+                charts.temp.data.datasets[0].data = sorted.map(d => ({ x: d.recorded_at.replace(' ', 'T'), y: d.temperature }));
+                charts.hum.data.datasets[0].data = sorted.map(d => ({ x: d.recorded_at.replace(' ', 'T'), y: d.humidity }));
+                charts.press.data.datasets[0].data = sorted.map(d => ({ x: d.recorded_at.replace(' ', 'T'), y: d.pressure }));
                 charts.temp.update();
                 charts.hum.update();
                 charts.press.update();
             }
 
-            // Форматирование даты для отображения
             function formatDate(isoStr) {
+                if (!isoStr) return '—';
                 const d = new Date(isoStr.replace(' ', 'T'));
                 return d.toLocaleString('ru-RU', {
                     day: '2-digit', month: '2-digit', year: 'numeric',
@@ -572,37 +591,31 @@ def web_dashboard():
                 });
             }
 
-            // Применение фильтров
-            function applyFilters() {
-                loadData();
-            }
+            function applyFilters() { loadData(); }
 
-            // Сброс фильтров
             function resetFilters() {
-                document.getElementById('fromDate').value = '';
-                document.getElementById('toDate').value = '';
+                setDefaultDates();
                 loadData();
             }
 
-            // Экспорт в CSV
             function exportCSV() {
                 if (currentData.length === 0) {
                     alert('Нет данных для экспорта');
                     return;
                 }
-                const headers = ['ID', 'Температура (°C)', 'Влажность (%)', 'Давление (hPa)', 'Дата и время'];
+                const headers = ['ID', 'Температура (°C)', 'Влажность (%)', 'Давление (мм рт.ст.)', 'Время устройства', 'Время сервера'];
                 const rows = currentData.map(d => [
                     d.id,
                     d.temperature.toFixed(2),
                     d.humidity.toFixed(2),
                     d.pressure.toFixed(2),
-                    d.recorded_at
+                    d.recorded_at,
+                    d.created_at || ''
                 ]);
                 const csvContent = [headers, ...rows]
                     .map(row => row.map(cell => `"${cell}"`).join(';'))
                     .join('\\n');
 
-                // Добавляем BOM для корректного отображения кириллицы в Excel
                 const blob = new Blob(['\\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
                 const url = URL.createObjectURL(blob);
                 const link = document.createElement('a');
@@ -615,25 +628,23 @@ def web_dashboard():
                 URL.revokeObjectURL(url);
             }
 
-            // Загрузка общего количества записей
             async function loadTotalCount() {
                 try {
-                    const resp = await fetch('/api/v1/sensors/all?limit=10000');
+                    const resp = await fetch('/api/v1/sensors/count');
                     const data = await resp.json();
-                    document.getElementById('totalCount').textContent = data.length;
+                    document.getElementById('totalCount').textContent = data.count;
                 } catch (e) {
                     console.error(e);
                 }
             }
 
-            // Инициализация
             document.addEventListener('DOMContentLoaded', () => {
                 initCharts();
+                setDefaultDates();  // Устанавливаем последние 7 дней
                 loadLatest();
                 loadData();
                 loadTotalCount();
 
-                // Автообновление каждые 30 секунд
                 setInterval(() => {
                     loadLatest();
                     loadData();
