@@ -25,7 +25,7 @@ def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
 
-        # Создаём таблицу (если её нет) с новым столбцом created_at
+        # Создаём таблицу с новым столбцом created_at
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sensor_readings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +38,7 @@ def init_db():
         ''')
         conn.commit()
 
-        # Миграция: добавляем created_at в существующую таблицу (если его нет)
+        # Миграция: добавляем created_at в существующую таблицу
         cursor.execute("PRAGMA table_info(sensor_readings)")
         columns = [col[1] for col in cursor.fetchall()]
         if 'created_at' not in columns:
@@ -69,7 +69,6 @@ def add_sensor_data(data: SensorData, _token: str = Depends(verify_token)):
 
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        # created_at заполнится автоматически через DEFAULT
         cursor.execute('''
             INSERT INTO sensor_readings (temperature, humidity, pressure, recorded_at)
             VALUES (?, ?, ?, ?)
@@ -96,29 +95,37 @@ def get_latest_data(_token: str = Depends(verify_token)):
 # --- API: Получение данных с фильтрацией (открытый доступ) ---
 @app.get("/api/v1/sensors/all")
 def get_all_data(
-        from_date: Optional[str] = Query(None, description="Начальная дата (YYYY-MM-DD)"),
-        to_date: Optional[str] = Query(None, description="Конечная дата (YYYY-MM-DD)")
+    limit: Optional[int] = Query(1000, ge=1, le=100000, description="Максимум записей (по умолчанию 1000)"),
+    from_date: Optional[str] = Query(None, description="Начальная дата (YYYY-MM-DD)"),
+    to_date: Optional[str] = Query(None, description="Конечная дата (YYYY-MM-DD)")
 ):
     """
-    Возвращает записи. Если фильтры не указаны — последние 7 дней.
+    Возвращает записи с возможностью фильтрации по диапазону дат.
+    Если фильтры не указаны — последние 1000 записей.
     Данные отсортированы по recorded_at убывания (новые сверху).
     """
-    # По умолчанию — последние 7 дней
-    if not from_date and not to_date:
-        to_date = datetime.now().strftime('%Y-%m-%d')
-        from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-
-    query = "SELECT * FROM sensor_readings WHERE 1=1"
+    query = "SELECT * FROM sensor_readings"
     params = []
+    conditions = []
 
+    # Фильтр по датам
     if from_date:
-        query += " AND recorded_at >= ?"
-        params.append(from_date + " 00:00:00")
+        conditions.append("recorded_at >= ?")
+        params.append(from_date.replace(' ', 'T') + "T00:00:00" if 'T' not in from_date else from_date)
     if to_date:
-        query += " AND recorded_at <= ?"
-        params.append(to_date + " 23:59:59")
+        conditions.append("recorded_at <= ?")
+        params.append(to_date.replace(' ', 'T') + "T23:59:59" if 'T' not in to_date else to_date)
 
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    # ВАЖНО: ORDER BY всегда идёт ДО LIMIT
     query += " ORDER BY recorded_at DESC"
+
+    # LIMIT применяем только если нет фильтра по датам
+    if not (from_date or to_date):
+        query += " LIMIT ?"
+        params.append(limit)
 
     with sqlite3.connect(DB_NAME) as conn:
         conn.row_factory = sqlite3.Row
@@ -384,8 +391,8 @@ def web_dashboard():
                     <input type="date" id="toDate">
                 </div>
                 <div class="btn-group">
-                    <button class="btn-primary" onclick="applyFilters()">🔍 Применить</button>
-                    <button class="btn-secondary" onclick="resetFilters()">↺ Сбросить (7 дней)</button>
+                    <button class="btn-primary" onclick="applyFilters()">🔍 Применить фильтр</button>
+                    <button class="btn-secondary" onclick="resetFilters()">↺ Сбросить (показать все)</button>
                     <button class="btn-success" onclick="exportCSV()">📥 Экспорт CSV</button>
                 </div>
             </div>
@@ -435,25 +442,6 @@ def web_dashboard():
         <script>
             let currentData = [];
             let charts = {};
-
-            // Форматирование даты для input type="date"
-            function formatDateForInput(date) {
-                const d = new Date(date);
-                const year = d.getFullYear();
-                const month = String(d.getMonth() + 1).padStart(2, '0');
-                const day = String(d.getDate()).padStart(2, '0');
-                return `${year}-${month}-${day}`;
-            }
-
-            // Установка фильтров по умолчанию (последние 7 дней)
-            function setDefaultDates() {
-                const today = new Date();
-                const sevenDaysAgo = new Date();
-                sevenDaysAgo.setDate(today.getDate() - 7);
-
-                document.getElementById('toDate').value = formatDateForInput(today);
-                document.getElementById('fromDate').value = formatDateForInput(sevenDaysAgo);
-            }
 
             function initCharts() {
                 const commonOptions = {
@@ -538,12 +526,20 @@ def web_dashboard():
                 const to = document.getElementById('toDate').value;
 
                 let url = '/api/v1/sensors/all?';
-                if (from) url += `from_date=${from}&`;
-                if (to) url += `to_date=${to}&`;
+                // Если фильтры заданы — применяем их, иначе показываем последние 1000 записей
+                if (from || to) {
+                    if (from) url += `from_date=${from}&`;
+                    if (to) url += `to_date=${to}&`;
+                } else {
+                    url += 'limit=1000&';
+                }
+
+                console.log('Запрос:', url);  // Для отладки
 
                 try {
                     const resp = await fetch(url);
                     currentData = await resp.json();
+                    console.log('Получено записей:', currentData.length);  // Для отладки
                     renderTable(currentData);
                     renderCharts(currentData);
                     document.getElementById('recordCount').textContent = `${currentData.length} записей`;
@@ -557,7 +553,7 @@ def web_dashboard():
             function renderTable(data) {
                 const tbody = document.getElementById('dataTable');
                 if (data.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;">Нет данных по выбранному периоду</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;">Нет данных</td></tr>';
                     return;
                 }
                 tbody.innerHTML = data.map(d => `
@@ -591,10 +587,13 @@ def web_dashboard():
                 });
             }
 
-            function applyFilters() { loadData(); }
+            function applyFilters() {
+                loadData();
+            }
 
             function resetFilters() {
-                setDefaultDates();
+                document.getElementById('fromDate').value = '';
+                document.getElementById('toDate').value = '';
                 loadData();
             }
 
@@ -640,7 +639,6 @@ def web_dashboard():
 
             document.addEventListener('DOMContentLoaded', () => {
                 initCharts();
-                setDefaultDates();  // Устанавливаем последние 7 дней
                 loadLatest();
                 loadData();
                 loadTotalCount();
