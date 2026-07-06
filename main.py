@@ -2,7 +2,7 @@ import sqlite3
 from fastapi import FastAPI, HTTPException, Header, Depends, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 # --- НАСТРОЙКИ ---
@@ -11,21 +11,17 @@ DB_NAME = "iot_data.db"
 
 app = FastAPI(title="Sensor Data API")
 
-
 # --- МОДЕЛЬ ДАННЫХ ---
 class SensorData(BaseModel):
     temperature: float = Field(..., description="Температура")
     humidity: float = Field(..., description="Влажность")
     pressure: float = Field(..., description="Давление")
-    recorded_at: str = Field(..., description="Дата и время с устройства (ISO 8601)")
-
+    recorded_at: str = Field(..., description="Дата и время в формате ISO 8601")
 
 # --- ИНИЦИАЛИЗАЦИЯ БД С МИГРАЦИЕЙ ---
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-
-        # Создаём таблицу с новым столбцом created_at
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sensor_readings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,15 +45,12 @@ def init_db():
             conn.commit()
             print("✅ Добавлен столбец created_at (UTC+5)")
 
-
 init_db()
-
 
 # --- ПРОВЕРКА ТОКЕНА ---
 def verify_token(x_api_token: str = Header(..., alias="X-API-Token")):
     if x_api_token != SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Неверный или отсутствующий токен доступа")
-
 
 # --- API: Добавление данных ---
 @app.post("/api/v1/sensors", status_code=201)
@@ -78,37 +71,17 @@ def add_sensor_data(data: SensorData, _token: str = Depends(verify_token)):
 
     return {"status": "success", "message": "Данные успешно сохранены", "id": new_id}
 
-
-# --- API: Последние показания ---
-@app.get("/api/v1/sensors/latest")
-def get_latest_data(_token: str = Depends(verify_token)):
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM sensor_readings ORDER BY id DESC LIMIT 1')
-        row = cursor.fetchone()
-    if row:
-        return dict(row)
-    raise HTTPException(status_code=404, detail="Данные еще не поступали")
-
-
 # --- API: Получение данных с фильтрацией (открытый доступ) ---
 @app.get("/api/v1/sensors/all")
 def get_all_data(
-    limit: Optional[int] = Query(1000, ge=1, le=100000, description="Максимум записей (по умолчанию 1000)"),
+    limit: Optional[int] = Query(1000, ge=1, le=100000, description="Максимум записей"),
     from_date: Optional[str] = Query(None, description="Начальная дата (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, description="Конечная дата (YYYY-MM-DD)")
 ):
-    """
-    Возвращает записи с возможностью фильтрации по диапазону дат.
-    Если фильтры не указаны — последние 1000 записей.
-    Данные отсортированы по recorded_at убывания (новые сверху).
-    """
     query = "SELECT * FROM sensor_readings"
     params = []
     conditions = []
 
-    # Фильтр по датам
     if from_date:
         conditions.append("recorded_at >= ?")
         params.append(from_date.replace(' ', 'T') + "T00:00:00" if 'T' not in from_date else from_date)
@@ -119,10 +92,9 @@ def get_all_data(
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
 
-    # ВАЖНО: ORDER BY всегда идёт ДО LIMIT
+    # ВАЖНО: ORDER BY всегда ДО LIMIT
     query += " ORDER BY recorded_at DESC"
 
-    # LIMIT применяем только если нет фильтра по датам
     if not (from_date or to_date):
         query += " LIMIT ?"
         params.append(limit)
@@ -135,7 +107,6 @@ def get_all_data(
 
     return [dict(row) for row in rows]
 
-
 # --- API: Общее количество записей ---
 @app.get("/api/v1/sensors/count")
 def get_total_count():
@@ -143,7 +114,6 @@ def get_total_count():
         cursor = conn.cursor()
         cursor.execute('SELECT COUNT(*) as cnt FROM sensor_readings')
         return {"count": cursor.fetchone()[0]}
-
 
 # --- ВЕБ-ИНТЕРФЕЙС ---
 @app.get("/", response_class=HTMLResponse)
@@ -167,11 +137,7 @@ def web_dashboard():
                 color: #333;
             }
             .container { max-width: 1300px; margin: 0 auto; }
-            header {
-                text-align: center;
-                color: white;
-                margin-bottom: 25px;
-            }
+            header { text-align: center; color: white; margin-bottom: 25px; }
             header h1 {
                 font-size: 2.5em;
                 margin-bottom: 10px;
@@ -238,12 +204,8 @@ def web_dashboard():
                 border: 2px solid #e0e0e0;
                 border-radius: 8px;
                 font-size: 0.95em;
-                transition: border-color 0.2s;
             }
-            .filter-group input:focus {
-                outline: none;
-                border-color: #667eea;
-            }
+            .filter-group input:focus { outline: none; border-color: #667eea; }
             .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
             button {
                 padding: 10px 20px;
@@ -256,11 +218,11 @@ def web_dashboard():
                 white-space: nowrap;
             }
             .btn-primary { background: #667eea; color: white; }
-            .btn-primary:hover { background: #5568d3; transform: translateY(-2px); }
+            .btn-primary:hover { background: #5568d3; }
             .btn-secondary { background: #e0e0e0; color: #333; }
             .btn-secondary:hover { background: #d0d0d0; }
             .btn-success { background: #27ae60; color: white; }
-            .btn-success:hover { background: #219a52; transform: translateY(-2px); }
+            .btn-success:hover { background: #219a52; }
 
             .charts {
                 display: grid;
@@ -274,15 +236,8 @@ def web_dashboard():
                 border-radius: 15px;
                 box-shadow: 0 10px 30px rgba(0,0,0,0.2);
             }
-            .chart-box h3 {
-                margin-bottom: 15px;
-                color: #333;
-                font-size: 1.1em;
-            }
-            .chart-wrapper {
-                position: relative;
-                height: 250px;
-            }
+            .chart-box h3 { margin-bottom: 15px; color: #333; font-size: 1.1em; }
+            .chart-wrapper { position: relative; height: 250px; }
 
             .table-container {
                 background: white;
@@ -309,30 +264,15 @@ def web_dashboard():
                 color: #666;
             }
             table { width: 100%; border-collapse: collapse; }
-            th, td {
-                padding: 12px;
-                text-align: left;
-                border-bottom: 1px solid #eee;
-            }
-            th {
-                background: #f8f9fa;
-                font-weight: 600;
-                color: #555;
-                position: sticky;
-                top: 0;
-            }
+            th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
+            th { background: #f8f9fa; font-weight: 600; color: #555; }
             tr:hover { background: #f8f9fa; }
             .temp { color: #e74c3c; font-weight: 600; }
             .hum { color: #3498db; font-weight: 600; }
             .press { color: #9b59b6; font-weight: 600; }
             .time-col { color: #888; font-size: 0.9em; }
 
-            .loader {
-                text-align: center;
-                padding: 40px;
-                color: #666;
-                font-size: 1.1em;
-            }
+            .loader { text-align: center; padding: 40px; color: #666; }
             .spinner {
                 border: 3px solid #f3f3f3;
                 border-top: 3px solid #667eea;
@@ -354,18 +294,11 @@ def web_dashboard():
                 font-size: 1.2em;
                 color: #666;
             }
-            footer {
-                text-align: center;
-                color: white;
-                margin-top: 20px;
-                opacity: 0.8;
-                font-size: 0.9em;
-            }
+            footer { text-align: center; color: white; margin-top: 20px; opacity: 0.8; }
             @media (max-width: 600px) {
                 header h1 { font-size: 1.8em; }
                 .card-value { font-size: 2em; }
                 th, td { padding: 8px; font-size: 0.85em; }
-                .filters { flex-direction: column; }
             }
         </style>
     </head>
@@ -391,8 +324,8 @@ def web_dashboard():
                     <input type="date" id="toDate">
                 </div>
                 <div class="btn-group">
-                    <button class="btn-primary" onclick="applyFilters()">🔍 Применить фильтр</button>
-                    <button class="btn-secondary" onclick="resetFilters()">↺ Сбросить (показать все)</button>
+                    <button class="btn-primary" onclick="applyFilters()">🔍 Применить</button>
+                    <button class="btn-secondary" onclick="resetFilters()">↺ Сбросить</button>
                     <button class="btn-success" onclick="exportCSV()">📥 Экспорт CSV</button>
                 </div>
             </div>
@@ -450,12 +383,7 @@ def web_dashboard():
                     interaction: { intersect: false, mode: 'index' },
                     plugins: {
                         legend: { display: false },
-                        tooltip: {
-                            backgroundColor: 'rgba(0,0,0,0.8)',
-                            padding: 10,
-                            titleFont: { size: 13 },
-                            bodyFont: { size: 12 }
-                        }
+                        tooltip: { backgroundColor: 'rgba(0,0,0,0.8)', padding: 10 }
                     },
                     scales: {
                         x: {
@@ -488,37 +416,31 @@ def web_dashboard():
                 });
             }
 
-            async function loadLatest() {
-                try {
-                    const resp = await fetch('/api/v1/sensors/latest', {
-                        headers: { 'X-API-Token': 'my_super_secret_token_2026' }
-                    });
-                    if (!resp.ok) {
-                        document.getElementById('latestCards').innerHTML = 
-                            '<div class="empty">📭 Нет данных. Отправьте показания через API.</div>';
-                        return;
-                    }
-                    const d = await resp.json();
-                    document.getElementById('latestCards').innerHTML = `
-                        <div class="card temp-card">
-                            <div class="card-title">🌡️ Температура</div>
-                            <div class="card-value">${d.temperature.toFixed(1)} °C</div>
-                            <div class="card-time">${formatDate(d.recorded_at)}</div>
-                        </div>
-                        <div class="card hum-card">
-                            <div class="card-title">💧 Влажность</div>
-                            <div class="card-value">${d.humidity.toFixed(1)} %</div>
-                            <div class="card-time">${formatDate(d.recorded_at)}</div>
-                        </div>
-                        <div class="card press-card">
-                            <div class="card-title">🎯 Давление</div>
-                            <div class="card-value">${d.pressure.toFixed(1)} мм рт.ст.</div>
-                            <div class="card-time">${formatDate(d.recorded_at)}</div>
-                        </div>
-                    `;
-                } catch (e) {
-                    console.error('Ошибка загрузки последних данных:', e);
+            // Рендер карточек из уже загруженных данных (первый элемент = последний)
+            function renderLatestCards() {
+                const container = document.getElementById('latestCards');
+                if (currentData.length === 0) {
+                    container.innerHTML = '<div class="empty">📭 Нет данных. Отправьте показания через API.</div>';
+                    return;
                 }
+                const d = currentData[0];  // Данные уже отсортированы по убыванию
+                container.innerHTML = `
+                    <div class="card temp-card">
+                        <div class="card-title">🌡️ Температура</div>
+                        <div class="card-value">${d.temperature.toFixed(1)} °C</div>
+                        <div class="card-time">${formatDate(d.recorded_at)}</div>
+                    </div>
+                    <div class="card hum-card">
+                        <div class="card-title">💧 Влажность</div>
+                        <div class="card-value">${d.humidity.toFixed(1)} %</div>
+                        <div class="card-time">${formatDate(d.recorded_at)}</div>
+                    </div>
+                    <div class="card press-card">
+                        <div class="card-title">🎯 Давление</div>
+                        <div class="card-value">${d.pressure.toFixed(1)} мм рт.ст.</div>
+                        <div class="card-time">${formatDate(d.recorded_at)}</div>
+                    </div>
+                `;
             }
 
             async function loadData() {
@@ -526,7 +448,6 @@ def web_dashboard():
                 const to = document.getElementById('toDate').value;
 
                 let url = '/api/v1/sensors/all?';
-                // Если фильтры заданы — применяем их, иначе показываем последние 1000 записей
                 if (from || to) {
                     if (from) url += `from_date=${from}&`;
                     if (to) url += `to_date=${to}&`;
@@ -534,19 +455,16 @@ def web_dashboard():
                     url += 'limit=1000&';
                 }
 
-                console.log('Запрос:', url);  // Для отладки
-
                 try {
                     const resp = await fetch(url);
                     currentData = await resp.json();
-                    console.log('Получено записей:', currentData.length);  // Для отладки
+                    console.log('Записей получено:', currentData.length);
+                    renderLatestCards();  // Карточки из тех же данных
                     renderTable(currentData);
                     renderCharts(currentData);
                     document.getElementById('recordCount').textContent = `${currentData.length} записей`;
                 } catch (e) {
                     console.error('Ошибка загрузки данных:', e);
-                    document.getElementById('dataTable').innerHTML =
-                        '<tr><td colspan="6" style="text-align:center;color:#e74c3c;">Ошибка загрузки данных</td></tr>';
                 }
             }
 
@@ -587,9 +505,7 @@ def web_dashboard():
                 });
             }
 
-            function applyFilters() {
-                loadData();
-            }
+            function applyFilters() { loadData(); }
 
             function resetFilters() {
                 document.getElementById('fromDate').value = '';
@@ -604,12 +520,8 @@ def web_dashboard():
                 }
                 const headers = ['ID', 'Температура (°C)', 'Влажность (%)', 'Давление (мм рт.ст.)', 'Время устройства', 'Время сервера'];
                 const rows = currentData.map(d => [
-                    d.id,
-                    d.temperature.toFixed(2),
-                    d.humidity.toFixed(2),
-                    d.pressure.toFixed(2),
-                    d.recorded_at,
-                    d.created_at || ''
+                    d.id, d.temperature.toFixed(2), d.humidity.toFixed(2),
+                    d.pressure.toFixed(2), d.recorded_at, d.created_at || ''
                 ]);
                 const csvContent = [headers, ...rows]
                     .map(row => row.map(cell => `"${cell}"`).join(';'))
@@ -639,12 +551,10 @@ def web_dashboard():
 
             document.addEventListener('DOMContentLoaded', () => {
                 initCharts();
-                loadLatest();
                 loadData();
                 loadTotalCount();
 
                 setInterval(() => {
-                    loadLatest();
                     loadData();
                     loadTotalCount();
                 }, 30000);
