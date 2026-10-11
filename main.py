@@ -80,7 +80,9 @@ def get_all_data(
 ):
     query = "SELECT * FROM sensor_readings"
     params = []
-    conditions = []
+    #conditions = []
+    conditions = ["temperature <= 150"]
+
 
     if from_date:
         conditions.append("recorded_at >= ?")
